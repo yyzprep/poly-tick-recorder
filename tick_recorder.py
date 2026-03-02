@@ -115,11 +115,13 @@ BINANCE_SYMBOL = {
     "SOL": "solusdt",
     "XRP": "xrpusdt",
 }
+ASSET_INT = {"BTC": 0, "ETH": 1, "SOL": 2, "XRP": 3}
 
 @dataclass
 class AssetState:
     asset: str
     market_id: str = ""
+    win_id: int = 0
     title: str = ""
     token_id_up: str = ""
     token_id_down: str = ""
@@ -197,6 +199,12 @@ class TickDataRecorder:
         conn = sqlite3.connect(db_path)
         self._setup_pragmas(conn)
         self._create_tables(conn)
+        # Win ID allocation: load existing mappings so we resume numbering
+        self._win_id_map: dict[str, int] = {}
+        self._next_win_id = 1
+        for row_id, mid in conn.execute("SELECT id, market_id FROM market_windows"):
+            self._win_id_map[mid] = row_id
+            self._next_win_id = max(self._next_win_id, row_id + 1)
         conn.close()
         self._thread = threading.Thread(target=self._writer_loop, daemon=True)
         self._thread.start()
@@ -210,6 +218,7 @@ class TickDataRecorder:
         conn.execute("PRAGMA temp_store=MEMORY")
 
     def _create_tables(self, conn):
+        # market_windows: full metadata (small table, TEXT is fine)
         conn.execute("""CREATE TABLE IF NOT EXISTS market_windows (
             id INTEGER PRIMARY KEY,
             asset TEXT NOT NULL,
@@ -222,33 +231,39 @@ class TickDataRecorder:
             end_time REAL,
             UNIQUE(market_id)
         )""")
+        # price_ticks: OPTIMIZED — integers replace repeated TEXT strings
+        # win_id  -> market_windows.id (4 bytes vs 66-byte market_id)
+        # et      -> 0=price_change, 1=last_trade_price (1 byte vs 12-20 byte TEXT)
+        # tk      -> 0=down, 1=up token (1 byte vs 77-byte asset_id)
+        # sd      -> 0=BUY, 1=SELL, NULL=trade (1 byte vs 3-4 byte TEXT)
+        # ~50 bytes/row instead of ~206 bytes/row (4x smaller)
         conn.execute("""CREATE TABLE IF NOT EXISTS price_ticks (
             id INTEGER PRIMARY KEY,
             ts REAL NOT NULL,
             server_ts REAL,
-            asset TEXT NOT NULL,
-            market_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            asset_id TEXT,
-            side TEXT,
+            win_id INTEGER NOT NULL,
+            et INTEGER NOT NULL,
+            tk INTEGER NOT NULL,
+            sd INTEGER,
             price REAL,
             size REAL,
             best_bid REAL,
             best_ask REAL
         )""")
+        # book_snapshots: OPTIMIZED — win_id + tk replace market_id + asset_id
         conn.execute("""CREATE TABLE IF NOT EXISTS book_snapshots (
             id INTEGER PRIMARY KEY,
             ts REAL NOT NULL,
             server_ts REAL,
-            asset TEXT NOT NULL,
-            market_id TEXT NOT NULL,
-            asset_id TEXT NOT NULL,
+            win_id INTEGER NOT NULL,
+            tk INTEGER NOT NULL,
             data BLOB NOT NULL
         )""")
+        # ref_prices: OPTIMIZED — asset as integer (0=BTC,1=ETH,2=SOL,3=XRP)
         conn.execute("""CREATE TABLE IF NOT EXISTS ref_prices (
             id INTEGER PRIMARY KEY,
             ts REAL NOT NULL,
-            asset TEXT NOT NULL,
+            a INTEGER NOT NULL,
             price REAL NOT NULL,
             qty REAL
         )""")
@@ -275,12 +290,10 @@ class TickDataRecorder:
             ws_reconnects INTEGER,
             last_error TEXT
         )""")
-        # Indexes
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_ticks_asset_ts ON price_ticks(asset, ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_ticks_market_ts ON price_ticks(market_id, ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_books_asset_ts ON book_snapshots(asset, ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_books_market_ts ON book_snapshots(market_id, ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_ref_asset_ts ON ref_prices(asset, ts)")
+        # Indexes — use integer columns for fast filtering
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ticks_win_ts ON price_ticks(win_id, ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_books_win_ts ON book_snapshots(win_id, ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ref_a_ts ON ref_prices(a, ts)")
         conn.commit()
 
     def _writer_loop(self):
@@ -312,24 +325,24 @@ class TickDataRecorder:
         try:
             if windows:
                 conn.executemany(
-                    "INSERT OR IGNORE INTO market_windows (asset, market_id, title, token_id_up, token_id_down, slug, start_time, end_time) VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO market_windows (id, asset, market_id, title, token_id_up, token_id_down, slug, start_time, end_time) VALUES (?,?,?,?,?,?,?,?,?)",
                     windows,
                 )
             if ticks:
                 conn.executemany(
-                    "INSERT INTO price_ticks (ts, server_ts, asset, market_id, event_type, asset_id, side, price, size, best_bid, best_ask) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO price_ticks (ts, server_ts, win_id, et, tk, sd, price, size, best_bid, best_ask) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     ticks,
                 )
                 self.total_ticks += len(ticks)
             if books:
                 conn.executemany(
-                    "INSERT INTO book_snapshots (ts, server_ts, asset, market_id, asset_id, data) VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO book_snapshots (ts, server_ts, win_id, tk, data) VALUES (?,?,?,?,?)",
                     books,
                 )
                 self.total_books += len(books)
             if ref:
                 conn.executemany(
-                    "INSERT INTO ref_prices (ts, asset, price, qty) VALUES (?,?,?,?)",
+                    "INSERT INTO ref_prices (ts, a, price, qty) VALUES (?,?,?,?)",
                     ref,
                 )
                 self.total_ref += len(ref)
@@ -344,19 +357,30 @@ class TickDataRecorder:
 
     # --- Public API (event loop only — just list.append) ---
 
-    def record_window(self, asset, market_id, title, token_up, token_down, slug, start_time, end_time):
-        self._buf_windows.append((asset, market_id, title, token_up, token_down, slug, start_time, end_time))
+    def allocate_win_id(self, market_id: str) -> int:
+        """Get or create an integer win_id for a market_id. Thread-safe via GIL."""
+        wid = self._win_id_map.get(market_id)
+        if wid is None:
+            wid = self._next_win_id
+            self._next_win_id += 1
+            self._win_id_map[market_id] = wid
+        return wid
 
-    def record_tick(self, ts, server_ts, asset, market_id, event_type, asset_id, side, price, size, best_bid, best_ask):
-        self._buf_ticks.append((ts, server_ts, asset, market_id, event_type, asset_id, side, price, size, best_bid, best_ask))
+    def record_window(self, win_id, asset, market_id, title, token_up, token_down, slug, start_time, end_time):
+        self._buf_windows.append((win_id, asset, market_id, title, token_up, token_down, slug, start_time, end_time))
+
+    def record_tick(self, ts, server_ts, win_id, et, tk, sd, price, size, best_bid, best_ask):
+        """et: 0=price_change, 1=last_trade_price. tk: 0=down, 1=up. sd: 0=BUY, 1=SELL, None=trade."""
+        self._buf_ticks.append((ts, server_ts, win_id, et, tk, sd, price, size, best_bid, best_ask))
         self.buffer_depth += 1
 
-    def record_book(self, ts, server_ts, asset, market_id, asset_id, blob):
-        self._buf_books.append((ts, server_ts, asset, market_id, asset_id, blob))
+    def record_book(self, ts, server_ts, win_id, tk, blob):
+        self._buf_books.append((ts, server_ts, win_id, tk, blob))
         self.buffer_depth += 1
 
-    def record_ref(self, ts, asset, price, qty):
-        self._buf_ref.append((ts, asset, price, qty))
+    def record_ref(self, ts, asset_int, price, qty):
+        """asset_int: 0=BTC, 1=ETH, 2=SOL, 3=XRP."""
+        self._buf_ref.append((ts, asset_int, price, qty))
 
     def record_session(self, market_id, asset, slug, title, end_time, first_sr, last_sr, span, tick_count, ticks_blob, collected_at):
         self._buf_sessions.append((market_id, asset, slug, title, end_time, first_sr, last_sr, span, tick_count, None, ticks_blob, collected_at))
@@ -436,8 +460,9 @@ async def discover_one(session: aiohttp.ClientSession, ast: AssetState, window_s
                 log.info(f"[{ast.asset}] ROLLOVER -> {ast.title}")
 
                 if recorder:
+                    ast.win_id = recorder.allocate_win_id(new_id)
                     recorder.record_window(
-                        ast.asset, new_id, ast.title,
+                        ast.win_id, ast.asset, new_id, ast.title,
                         ast.token_id_up, ast.token_id_down,
                         slug, float(window_start), end_ts,
                     )
@@ -590,7 +615,7 @@ def _process_poly_event(event: dict, now_t: float):
             if blob_crc != ast._last_up_crc:
                 ast._last_up_crc = blob_crc
                 if recorder:
-                    recorder.record_book(now_t, server_ts, ast.asset, ast.market_id, aid, blob)
+                    recorder.record_book(now_t, server_ts, ast.win_id, 1, blob)  # tk=1 (up)
             else:
                 if recorder:
                     recorder.total_deduped += 1
@@ -610,7 +635,7 @@ def _process_poly_event(event: dict, now_t: float):
             if blob_crc != ast._last_down_crc:
                 ast._last_down_crc = blob_crc
                 if recorder:
-                    recorder.record_book(now_t, server_ts, ast.asset, ast.market_id, aid, blob)
+                    recorder.record_book(now_t, server_ts, ast.win_id, 0, blob)  # tk=0 (down)
             else:
                 if recorder:
                     recorder.total_deduped += 1
@@ -628,11 +653,12 @@ def _process_poly_event(event: dict, now_t: float):
             bb = float(pc["best_bid"]) if "best_bid" in pc else None
             ba = float(pc["best_ask"]) if "best_ask" in pc else None
 
+            # Integer encode: tk (0=down,1=up), sd (0=BUY,1=SELL)
+            tk = 1 if side_name == "up" else 0
+            sd = 0 if order_side == "BUY" else (1 if order_side == "SELL" else None)
+
             if recorder:
-                recorder.record_tick(
-                    now_t, server_ts, ast.asset, ast.market_id,
-                    "price_change", aid, order_side, p, s, bb, ba,
-                )
+                recorder.record_tick(now_t, server_ts, ast.win_id, 0, tk, sd, p, s, bb, ba)  # et=0 (price_change)
 
             # Update in-memory book
             if side_name == "up":
@@ -671,13 +697,11 @@ def _process_poly_event(event: dict, now_t: float):
         route = token_route.get(aid)
         if not route:
             return
-        ast, _ = route
+        ast, side_name = route
         trade_price = float(event["price"])
+        tk = 1 if side_name == "up" else 0
         if recorder:
-            recorder.record_tick(
-                now_t, server_ts, ast.asset, ast.market_id,
-                "last_trade_price", aid, None, trade_price, None, None, None,
-            )
+            recorder.record_tick(now_t, server_ts, ast.win_id, 1, tk, None, trade_price, None, None, None)  # et=1 (last_trade_price)
 
 # ==========================================
 # BINANCE WEBSOCKET WORKER
@@ -708,7 +732,7 @@ async def binance_ws_worker():
                     qty = float(payload["q"])
                     ts = float(payload["T"]) / 1000.0
                     if recorder:
-                        recorder.record_ref(ts, asset, price, qty)
+                        recorder.record_ref(ts, ASSET_INT[asset], price, qty)
         except Exception as e:
             err_str = str(e)
             if "451" in err_str and endpoint_idx == 0:
@@ -748,11 +772,11 @@ def _build_session(ast: AssetState):
     """Build a backward-compatible session row from granular tick data."""
     conn = sqlite3.connect(DB_PATH)
     try:
-        # Get all price_ticks for this market, ordered by time
+        # Get all price_ticks for this market window, ordered by time
         rows = conn.execute(
-            "SELECT ts, event_type, asset_id, side, price, size, best_bid, best_ask "
-            "FROM price_ticks WHERE market_id = ? ORDER BY ts",
-            (ast.market_id,)
+            "SELECT ts, et, tk, sd, price, size, best_bid, best_ask "
+            "FROM price_ticks WHERE win_id = ? ORDER BY ts",
+            (ast.win_id,)
         ).fetchall()
 
         if not rows:
@@ -761,9 +785,10 @@ def _build_session(ast: AssetState):
         # Get ref prices for this time range
         ts_min = rows[0][0]
         ts_max = rows[-1][0]
+        asset_int = ASSET_INT[ast.asset]
         ref_rows = conn.execute(
-            "SELECT ts, price FROM ref_prices WHERE asset = ? AND ts BETWEEN ? AND ? ORDER BY ts",
-            (ast.asset, ts_min - 1, ts_max + 1)
+            "SELECT ts, price FROM ref_prices WHERE a = ? AND ts BETWEEN ? AND ? ORDER BY ts",
+            (asset_int, ts_min - 1, ts_max + 1)
         ).fetchall()
 
         # Build tick array: [ts, sr, up_mid, down_mid, up_ask, up_bid, down_ask, down_bid]
@@ -775,10 +800,9 @@ def _build_session(ast: AssetState):
         cur_down_ask = 0.0
         ref_idx = 0
 
-        for ts, etype, aid, side, price, size, bb, ba in rows:
-            if etype == "price_change":
-                # Determine if this is for up or down token
-                is_up = (aid == ast.token_id_up)
+        for ts, et, tk, sd, price, size, bb, ba in rows:
+            if et == 0:  # price_change
+                is_up = (tk == 1)
                 if is_up:
                     if bb is not None:
                         cur_up_bid = bb
@@ -879,48 +903,49 @@ def _do_archival():
     conn.execute("PRAGMA journal_mode=WAL")
 
     _archive_table(conn, day_dir, date_str, "price_ticks", cutoff,
-        "SELECT ts, server_ts, asset, market_id, event_type, asset_id, side, price, size, best_bid, best_ask FROM price_ticks WHERE ts <= ?",
+        "SELECT ts, server_ts, win_id, et, tk, sd, price, size, best_bid, best_ask FROM price_ticks WHERE ts <= ?",
         {
-            "ts": pa.float64(), "server_ts": pa.float64(), "asset": pa.string(),
-            "market_id": pa.string(), "event_type": pa.string(), "asset_id": pa.string(),
-            "side": pa.string(), "price": pa.float64(), "size": pa.float64(),
+            "ts": pa.float64(), "server_ts": pa.float64(), "win_id": pa.int64(),
+            "et": pa.int8(), "tk": pa.int8(), "sd": pa.int8(),
+            "price": pa.float64(), "size": pa.float64(),
             "best_bid": pa.float64(), "best_ask": pa.float64(),
         },
         "DELETE FROM price_ticks WHERE ts <= ?",
     )
 
     _archive_table(conn, day_dir, date_str, "book_snapshots", cutoff,
-        "SELECT ts, server_ts, asset, market_id, asset_id, data FROM book_snapshots WHERE ts <= ?",
+        "SELECT ts, server_ts, win_id, tk, data FROM book_snapshots WHERE ts <= ?",
         {
-            "ts": pa.float64(), "server_ts": pa.float64(), "asset": pa.string(),
-            "market_id": pa.string(), "asset_id": pa.string(), "data": pa.binary(),
+            "ts": pa.float64(), "server_ts": pa.float64(), "win_id": pa.int64(),
+            "tk": pa.int8(), "data": pa.binary(),
         },
         "DELETE FROM book_snapshots WHERE ts <= ?",
     )
 
     _archive_table(conn, day_dir, date_str, "ref_prices", cutoff,
-        "SELECT ts, asset, price, qty FROM ref_prices WHERE ts <= ?",
+        "SELECT ts, a, price, qty FROM ref_prices WHERE ts <= ?",
         {
-            "ts": pa.float64(), "asset": pa.string(),
+            "ts": pa.float64(), "a": pa.int8(),
             "price": pa.float64(), "qty": pa.float64(),
         },
         "DELETE FROM ref_prices WHERE ts <= ?",
     )
 
-    # Market windows: export all (no delete — they're small and useful)
+    # Market windows: export all (no delete — they're small and useful for joining win_id)
     rows = conn.execute(
-        "SELECT asset, market_id, title, token_id_up, token_id_down, slug, start_time, end_time FROM market_windows"
+        "SELECT id, asset, market_id, title, token_id_up, token_id_down, slug, start_time, end_time FROM market_windows"
     ).fetchall()
     if rows:
         table = pa.table({
-            "asset": pa.array([r[0] for r in rows], type=pa.string()),
-            "market_id": pa.array([r[1] for r in rows], type=pa.string()),
-            "title": pa.array([r[2] for r in rows], type=pa.string()),
-            "token_id_up": pa.array([r[3] for r in rows], type=pa.string()),
-            "token_id_down": pa.array([r[4] for r in rows], type=pa.string()),
-            "slug": pa.array([r[5] for r in rows], type=pa.string()),
-            "start_time": pa.array([r[6] for r in rows], type=pa.float64()),
-            "end_time": pa.array([r[7] for r in rows], type=pa.float64()),
+            "id": pa.array([r[0] for r in rows], type=pa.int64()),
+            "asset": pa.array([r[1] for r in rows], type=pa.string()),
+            "market_id": pa.array([r[2] for r in rows], type=pa.string()),
+            "title": pa.array([r[3] for r in rows], type=pa.string()),
+            "token_id_up": pa.array([r[4] for r in rows], type=pa.string()),
+            "token_id_down": pa.array([r[5] for r in rows], type=pa.string()),
+            "slug": pa.array([r[6] for r in rows], type=pa.string()),
+            "start_time": pa.array([r[7] for r in rows], type=pa.float64()),
+            "end_time": pa.array([r[8] for r in rows], type=pa.float64()),
         })
         out = os.path.join(day_dir, "market_windows.parquet")
         pq.write_table(table, out, compression="snappy")
