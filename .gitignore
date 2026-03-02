@@ -1,0 +1,7 @@
+.env
+tick_data/
+*.db
+__pycache__/
+node_modules/
+nul
+.claude/
