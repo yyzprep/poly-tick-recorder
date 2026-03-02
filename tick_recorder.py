@@ -88,7 +88,10 @@ WINDOW_SECONDS = 300            # 5-min windows
 # URLs
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
 POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-BINANCE_WS = "wss://stream.binance.com:9443/stream?streams={streams}"
+BINANCE_ENDPOINTS = [
+    "wss://stream.binance.com:9443/stream?streams={streams}",
+    "wss://stream.binance.us:9443/stream?streams={streams}",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -682,28 +685,36 @@ def _process_poly_event(event: dict, now_t: float):
 BINANCE_ASSET_MAP = {}  # built in main()
 
 async def binance_ws_worker():
-    """Streams reference prices from Binance combined aggTrade stream."""
+    """Streams reference prices from Binance combined aggTrade stream.
+    Tries global Binance first, falls back to Binance US if geo-blocked (HTTP 451).
+    """
     streams = "/".join(f"{BINANCE_SYMBOL[a]}@aggTrade" for a in ASSET_LIST if a in BINANCE_SYMBOL)
-    uri = BINANCE_WS.format(streams=streams)
+    endpoint_idx = 0  # start with global
 
     while True:
+        uri = BINANCE_ENDPOINTS[endpoint_idx].format(streams=streams)
         try:
             async with websockets.connect(uri, max_size=1024 * 1024) as ws:
-                log.info(f"Binance WS connected. Streams: {streams}")
+                label = "Binance.com" if endpoint_idx == 0 else "Binance.us"
+                log.info(f"{label} WS connected. Streams: {streams}")
                 async for msg in ws:
                     data = orjson.loads(msg)
                     stream = data.get("stream", "")
                     payload = data.get("data", {})
-                    # Extract asset from stream name (e.g. "btcusdt@aggTrade" -> "BTC")
                     asset = BINANCE_ASSET_MAP.get(stream.split("@")[0])
                     if not asset:
                         continue
                     price = float(payload["p"])
                     qty = float(payload["q"])
-                    ts = float(payload["T"]) / 1000.0  # Binance ms -> sec
+                    ts = float(payload["T"]) / 1000.0
                     if recorder:
                         recorder.record_ref(ts, asset, price, qty)
         except Exception as e:
+            err_str = str(e)
+            if "451" in err_str and endpoint_idx == 0:
+                log.warning("Binance.com geo-blocked (HTTP 451), switching to Binance.us")
+                endpoint_idx = 1
+                continue
             log.error(f"Binance WS error: {e}")
             await asyncio.sleep(1)
 
