@@ -138,7 +138,7 @@ class Portfolio {
   unrealizedPnL(currentBid, currentAsk) {
     let total = 0;
     for (const pos of this.positions) {
-      const exitPrice = pos.side === 'YES' ? currentBid : currentAsk; // what we'd get selling now
+      const exitPrice = pos.side === 'YES' ? currentAsk : currentBid; // YES tokens valued at ask, NO at bid
       total += (exitPrice * pos.size) - pos.cost;
     }
     return total;

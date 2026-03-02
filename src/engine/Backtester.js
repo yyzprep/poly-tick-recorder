@@ -208,7 +208,7 @@ class Backtester {
             return { success: false, error: 'No open positions to sell' };
           }
           const pos = portfolio.positions[0];
-          const exitPrice = pos.side === 'YES' ? tick.bid : tick.ask;
+          const exitPrice = pos.side === 'YES' ? tick.ask : tick.bid;
           return portfolio.sell({
             positionId: pos.id,
             price: exitPrice,
@@ -219,7 +219,7 @@ class Backtester {
         }
         const pos = portfolio.positions.find(p => p.id === positionId);
         if (!pos) return { success: false, error: `Position ${positionId} not found` };
-        const exitPrice = pos.side === 'YES' ? tick.bid : tick.ask;
+        const exitPrice = pos.side === 'YES' ? tick.ask : tick.bid;
         return portfolio.sell({
           positionId,
           price: exitPrice,
