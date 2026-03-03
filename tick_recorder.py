@@ -217,7 +217,25 @@ class TickDataRecorder:
         conn.execute("PRAGMA mmap_size=268435456")
         conn.execute("PRAGMA temp_store=MEMORY")
 
+    def _migrate_schema(self, conn):
+        """Detect old TEXT-based schema and drop/recreate affected tables."""
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='price_ticks'")
+        if not cursor.fetchone():
+            return  # fresh DB, nothing to migrate
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(price_ticks)")}
+        if "win_id" in cols:
+            return  # already new schema
+        log.warning("Old TEXT-based schema detected — dropping tick tables for new integer schema")
+        for tbl in ("price_ticks", "book_snapshots", "ref_prices", "recorder_status"):
+            conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+        # Drop old indexes too
+        for idx in ("idx_ticks_asset_ts", "idx_ticks_market_ts", "idx_books_asset_ts", "idx_ref_asset_ts"):
+            conn.execute(f"DROP INDEX IF EXISTS {idx}")
+        conn.commit()
+
     def _create_tables(self, conn):
+        # Detect old TEXT-based schema and drop/recreate if needed
+        self._migrate_schema(conn)
         # market_windows: full metadata (small table, TEXT is fine)
         conn.execute("""CREATE TABLE IF NOT EXISTS market_windows (
             id INTEGER PRIMARY KEY,
