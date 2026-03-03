@@ -10,6 +10,7 @@ Deploy to Railway for 24/7 recording, with S3 sync for local data access.
 Usage:
     python tick_recorder.py                    # normal recording
     python tick_recorder.py --migrate          # import collected_sessions.db into tick_data.db
+    python tick_recorder.py --sync             # pull Parquet from S3 into local tick_data.db
 """
 
 import asyncio
@@ -1110,6 +1111,171 @@ def migrate_legacy():
     log.info(f"Migration complete. {total:,} sessions imported.")
 
 # ==========================================
+# S3 SYNC (pull Parquet from S3 → local SQLite)
+# ==========================================
+INT_TO_ASSET = {v: k for k, v in ASSET_INT.items()}
+ET_TO_STR = {0: "price_change", 1: "last_trade_price"}
+TK_TO_STR = {0: "down", 1: "up"}
+SD_TO_STR = {0: "BUY", 1: "SELL"}
+
+def sync_from_s3():
+    """Download Parquet files from S3 and import into local tick_data.db."""
+    if not HAS_S3:
+        log.error("boto3 not installed — cannot sync from S3.")
+        return
+    if not S3_BUCKET:
+        log.error("S3_BUCKET not set. Configure .env or environment.")
+        return
+    if not HAS_PARQUET:
+        log.error("pyarrow not installed — cannot read Parquet.")
+        return
+
+    client = _get_s3_client()
+    if not client:
+        log.error("Failed to create S3 client.")
+        return
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    # List all date prefixes under S3_PREFIX
+    paginator = client.get_paginator("list_objects_v2")
+    prefix = S3_PREFIX
+    parquet_keys = []
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".parquet"):
+                parquet_keys.append(obj["Key"])
+
+    if not parquet_keys:
+        log.info("No Parquet files found in S3.")
+        return
+
+    log.info(f"Found {len(parquet_keys)} Parquet files in s3://{S3_BUCKET}/{prefix}")
+
+    # Download to local DATA_DIR preserving directory structure
+    local_files = []
+    for key in parquet_keys:
+        # key like: polymarket-ticks/2026-03-02/price_ticks.parquet
+        rel = key[len(prefix):]  # 2026-03-02/price_ticks.parquet
+        local_path = os.path.join(DATA_DIR, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        log.info(f"  Downloading {key} -> {local_path}")
+        client.download_file(S3_BUCKET, key, local_path)
+        local_files.append(local_path)
+
+    # Now import Parquet files into SQLite
+    conn = sqlite3.connect(DB_PATH)
+    rec = TickDataRecorder.__new__(TickDataRecorder)
+    rec._db_path = DB_PATH
+    rec._setup_pragmas(conn)
+    rec._create_tables(conn)
+
+    total_imported = {"market_windows": 0, "price_ticks": 0, "book_snapshots": 0, "ref_prices": 0}
+
+    for fpath in sorted(local_files):
+        fname = os.path.basename(fpath)
+        table_name = fname.replace(".parquet", "")
+
+        if table_name not in total_imported:
+            continue
+
+        table = pq.read_table(fpath)
+        df_len = table.num_rows
+        if df_len == 0:
+            continue
+
+        col_names = set(table.column_names)
+
+        if table_name == "market_windows":
+            has_id = "id" in col_names
+            # Get next available ID if old schema (no id column)
+            if not has_id:
+                max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM market_windows").fetchone()[0]
+            rows = []
+            for i in range(df_len):
+                wid = table.column("id")[i].as_py() if has_id else (max_id + i + 1)
+                rows.append((
+                    wid,
+                    table.column("asset")[i].as_py(),
+                    table.column("market_id")[i].as_py(),
+                    table.column("title")[i].as_py(),
+                    table.column("token_id_up")[i].as_py(),
+                    table.column("token_id_down")[i].as_py(),
+                    table.column("slug")[i].as_py(),
+                    table.column("start_time")[i].as_py(),
+                    table.column("end_time")[i].as_py(),
+                ))
+            conn.executemany(
+                "INSERT OR IGNORE INTO market_windows (id, asset, market_id, title, token_id_up, token_id_down, slug, start_time, end_time) VALUES (?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
+
+        elif table_name == "price_ticks":
+            if "win_id" not in col_names:
+                log.warning(f"  Skipping {fname} (old TEXT schema)")
+                continue
+            rows = []
+            for i in range(df_len):
+                rows.append((
+                    table.column("ts")[i].as_py(),
+                    table.column("server_ts")[i].as_py(),
+                    table.column("win_id")[i].as_py(),
+                    table.column("et")[i].as_py(),
+                    table.column("tk")[i].as_py(),
+                    table.column("sd")[i].as_py(),
+                    table.column("price")[i].as_py(),
+                    table.column("size")[i].as_py(),
+                    table.column("best_bid")[i].as_py(),
+                    table.column("best_ask")[i].as_py(),
+                ))
+            conn.executemany(
+                "INSERT INTO price_ticks (ts, server_ts, win_id, et, tk, sd, price, size, best_bid, best_ask) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
+
+        elif table_name == "book_snapshots":
+            if "win_id" not in col_names:
+                log.warning(f"  Skipping {fname} (old TEXT schema)")
+                continue
+            rows = []
+            for i in range(df_len):
+                rows.append((
+                    table.column("ts")[i].as_py(),
+                    table.column("server_ts")[i].as_py(),
+                    table.column("win_id")[i].as_py(),
+                    table.column("tk")[i].as_py(),
+                    table.column("data")[i].as_py(),
+                ))
+            conn.executemany(
+                "INSERT INTO book_snapshots (ts, server_ts, win_id, tk, data) VALUES (?,?,?,?,?)",
+                rows,
+            )
+
+        elif table_name == "ref_prices":
+            if "a" not in col_names:
+                log.warning(f"  Skipping {fname} (old TEXT schema)")
+                continue
+            rows = []
+            for i in range(df_len):
+                rows.append((
+                    table.column("ts")[i].as_py(),
+                    table.column("a")[i].as_py(),
+                    table.column("price")[i].as_py(),
+                    table.column("qty")[i].as_py(),
+                ))
+            conn.executemany(
+                "INSERT INTO ref_prices (ts, a, price, qty) VALUES (?,?,?,?)",
+                rows,
+            )
+
+        conn.commit()
+        total_imported[table_name] += df_len
+        log.info(f"  Imported {df_len:,} rows from {fname}")
+
+    conn.close()
+    log.info(f"Sync complete: {total_imported}")
+
+# ==========================================
 # GRACEFUL SHUTDOWN
 # ==========================================
 def _signal_handler(sig, frame):
@@ -1160,10 +1326,14 @@ async def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Polymarket Multi-Asset Tick Data Recorder")
     parser.add_argument("--migrate", action="store_true", help="Import collected_sessions.db into tick_data.db")
+    parser.add_argument("--sync", action="store_true", help="Pull Parquet files from S3 into local tick_data.db")
     args = parser.parse_args()
 
     if args.migrate:
         migrate_legacy()
+        sys.exit(0)
+    if args.sync:
+        sync_from_s3()
         sys.exit(0)
 
     # Signal handlers for graceful shutdown
